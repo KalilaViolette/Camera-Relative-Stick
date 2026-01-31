@@ -37,7 +37,9 @@ RESET_DEFAULTS = {
   "mouse_accel": 1.35,
   "mouse_invert_y": False,
   "mouse_activation_mode": "always",
-  "mouse_hold_key": "r3"
+  "mouse_hold_key": "r3",
+  # Arrow key "press length" in ms (for games that ignore ultra-short taps). Capped to 250ms.
+  "arrow_hold_ms": 120
 }
 
 
@@ -84,14 +86,20 @@ INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 
 MOUSEEVENTF_MOVE = 0x0001
-KEYEVENTF_KEYUP = 0x0002
 
-# Virtual-Key codes
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+
+# Virtual-Key codes (used for function keys / combos)
 VK_F8 = 0x77
 VK_F11 = 0x7A
 VK_F12 = 0x7B
-VK_UP = 0x26
-VK_DOWN = 0x28
+
+# Arrow keys by Enter are "extended" keys; many games behave better with scancodes.
+# Set 1 scancodes (E0-extended): Up=0x48, Down=0x50
+SCAN_UP = 0x48
+SCAN_DOWN = 0x50
 
 
 def mouse_move_relative(dx: int, dy: int) -> None:
@@ -137,6 +145,33 @@ def vk_tap(vk: int, tap_ms: int = 20) -> None:
     vk_key_up(vk)
 
 
+def _send_scan(scan: int, is_down: bool, extended: bool = True) -> None:
+    flags = KEYEVENTF_SCANCODE
+    if extended:
+        flags |= KEYEVENTF_EXTENDEDKEY
+    if not is_down:
+        flags |= KEYEVENTF_KEYUP
+
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.union.ki = KEYBDINPUT(
+        wVk=0,
+        wScan=scan,
+        dwFlags=flags,
+        time=0,
+        dwExtraInfo=None,
+    )
+    ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+
+def scan_key_down(scan: int, extended: bool = True) -> None:
+    _send_scan(scan, True, extended=extended)
+
+
+def scan_key_up(scan: int, extended: bool = True) -> None:
+    _send_scan(scan, False, extended=extended)
+
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -173,6 +208,8 @@ class Config:
 
     mouse_activation_mode: str = str(RESET_DEFAULTS["mouse_activation_mode"])
     mouse_hold_key: str = str(RESET_DEFAULTS["mouse_hold_key"])
+
+    arrow_hold_ms: int = int(RESET_DEFAULTS["arrow_hold_ms"])
 
     calibrated: bool = False
     calibration: Dict[str, Any] = field(default_factory=dict)
@@ -612,6 +649,12 @@ def controller_loop(state: SharedState, js: pygame.joystick.Joystick):
     next_up_fire = 0.0
     next_down_fire = 0.0
 
+    # Non-blocking "hold then release" state for arrow keys (prevents camera hitch)
+    up_is_down = False
+    down_is_down = False
+    up_release_at = 0.0
+    down_release_at = 0.0
+
     while not state.stop_event.is_set():
         now = time.perf_counter()
         dt = now - last_time
@@ -625,6 +668,14 @@ def controller_loop(state: SharedState, js: pygame.joystick.Joystick):
 
         cfg = state.snapshot()
         cal = cfg.calibration or {}
+
+        # Release arrows when their scheduled hold time ends (non-blocking)
+        if up_is_down and now >= up_release_at:
+            scan_key_up(SCAN_UP, extended=True)
+            up_is_down = False
+        if down_is_down and now >= down_release_at:
+            scan_key_up(SCAN_DOWN, extended=True)
+            down_is_down = False
 
         pygame.event.pump()
 
@@ -757,20 +808,37 @@ def controller_loop(state: SharedState, js: pygame.joystick.Joystick):
             f12_combo_armed = False
 
         # L1 + R1 + right stick up/down => arrow key repeat every 0.25s
+        # IMPORTANT:
+        # - Uses SCANCODES for the "real" arrow keys (near Enter).
+        # - No time.sleep for holds (non-blocking) -> camera stays smooth.
+        hold_s = clamp(float(cfg.arrow_hold_ms) / 1000.0, 0.01, 0.25)
+
         if l1 and r1 and (abs(ry) >= ry_threshold):
             if ry >= ry_threshold:
                 next_down_fire = 0.0
                 if now >= next_up_fire:
-                    vk_tap(VK_UP, tap_ms=10)
+                    if not up_is_down:
+                        scan_key_down(SCAN_UP, extended=True)
+                        up_is_down = True
+                    up_release_at = now + hold_s
                     next_up_fire = now + repeat_interval
             elif ry <= -ry_threshold:
                 next_up_fire = 0.0
                 if now >= next_down_fire:
-                    vk_tap(VK_DOWN, tap_ms=10)
+                    if not down_is_down:
+                        scan_key_down(SCAN_DOWN, extended=True)
+                        down_is_down = True
+                    down_release_at = now + hold_s
                     next_down_fire = now + repeat_interval
         else:
             next_up_fire = 0.0
             next_down_fire = 0.0
+            if up_is_down:
+                scan_key_up(SCAN_UP, extended=True)
+                up_is_down = False
+            if down_is_down:
+                scan_key_up(SCAN_DOWN, extended=True)
+                down_is_down = False
 
         # Mouse from right stick
         if cfg.mouse_enabled:
@@ -848,7 +916,6 @@ def build_gui(state: "SharedState"):
     style.configure("TButton", font=("Segoe UI", 9))
     style.configure("TScale", background="#151822")
 
-    # Hover/active readability for widgets that highlight
     style.map(
         "TCheckbutton",
         foreground=[("active", "#000000"), ("pressed", "#000000")],
@@ -858,7 +925,6 @@ def build_gui(state: "SharedState"):
         foreground=[("active", "#000000"), ("pressed", "#000000")],
     )
 
-    # Combobox: readable field + dropdown list
     style.configure(
         "TCombobox",
         foreground="#000000",
@@ -1040,6 +1106,10 @@ def build_gui(state: "SharedState"):
     add_slider(card1, "Output smoothing", "output_smoothing", 0.00, 0.90, 0.01, "{:.2f}")
     add_slider(card1, "Poll rate (Hz)", "poll_hz", 30, 500, 5, "{:.0f}", as_int=True)
 
+    # Hotkeys card
+    card_hot = make_card(outer, "Hotkeys")
+    add_slider(card_hot, "Arrow key hold (ms)", "arrow_hold_ms", 10, 250, 5, "{:.0f}", as_int=True)
+
     # Mouse card
     card2 = make_card(outer, "Mouse From Right Stick")
     add_check(card2, "Mouse enabled", "mouse_enabled")
@@ -1067,7 +1137,6 @@ def build_gui(state: "SharedState"):
         cur = state.snapshot()
         update = dict(RESET_DEFAULTS)
 
-        # Keep calibration info as-is so you do not have to recalibrate
         update["calibrated"] = bool(getattr(cur, "calibrated", False))
         update["calibration"] = dict(getattr(cur, "calibration", {}) or {})
 
@@ -1114,7 +1183,6 @@ def build_gui(state: "SharedState"):
 
     tick_status()
 
-    # Auto-size to content (and only allow resize if clamped to screen)
     root.update_idletasks()
     req_w = root.winfo_reqwidth()
     req_h = root.winfo_reqheight()
